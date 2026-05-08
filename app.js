@@ -35,16 +35,71 @@ const db = mysql.createConnection({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASS,
-  database: process.env.DB_NAME,
   connectTimeout: 10000,
 });
 
 db.connect((err) => {
   if (err) {
-    console.log("⚠️ Database belum connect");
-    console.log(err.code);
+    console.log("❌ Database gagal connect");
+    console.log(err);
   } else {
     console.log("✅ Database connected");
+
+    // =========================
+    // CREATE DATABASE
+    // =========================
+
+    db.query(`CREATE DATABASE IF NOT EXISTS laporwarga`, (err) => {
+      if (err) {
+        console.log("❌ Gagal create database");
+        console.log(err);
+      } else {
+        console.log("✅ Database laporwarga siap");
+
+        // =========================
+        // USE DATABASE
+        // =========================
+
+        db.changeUser(
+          {
+            database: "laporwarga",
+          },
+          (err) => {
+            if (err) {
+              console.log("❌ Gagal gunakan database");
+              console.log(err);
+            } else {
+              console.log("✅ Menggunakan database laporwarga");
+
+              // =========================
+              // CREATE TABLE
+              // =========================
+
+              const createTable = `
+                CREATE TABLE IF NOT EXISTS pengaduan (
+                  id INT AUTO_INCREMENT PRIMARY KEY,
+                  judul VARCHAR(255),
+                  deskripsi TEXT,
+                  kategori VARCHAR(100),
+                  foto_url TEXT,
+                  status_pengaduan VARCHAR(50) DEFAULT 'Pending',
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+              `;
+
+              db.query(createTable, (err) => {
+                if (err) {
+                  console.log("❌ Gagal create table");
+                  console.log(err);
+                } else {
+                  console.log("✅ Table pengaduan siap");
+                }
+              });
+            }
+          },
+        );
+      }
+    });
   }
 });
 
@@ -69,22 +124,67 @@ app.get("/", (req, res) => {
 });
 
 /* =========================
+   HEALTH CHECK
+========================= */
+
+app.get("/health", (req, res) => {
+  res.json({
+    success: true,
+    message: "Server running",
+    timestamp: new Date(),
+  });
+});
+
+/* =========================
    GET DATA
 ========================= */
 
 app.get("/api/pengaduan", (req, res) => {
-  // sementara dummy data dulu
-  const data = [
-    {
-      id: 1,
-      judul: "Jalan Rusak",
-      deskripsi: "Ada jalan berlubang di depan sekolah",
-      kategori: "Jalan Rusak",
-      foto_url: "",
-    },
-  ];
+  const sql = `
+    SELECT * FROM pengaduan
+    ORDER BY created_at DESC
+  `;
 
-  res.json(data);
+  db.query(sql, (err, result) => {
+    if (err) {
+      console.log(err);
+
+      return res.status(500).json({
+        success: false,
+        message: "Gagal mengambil data",
+      });
+    }
+
+    return res.json(result);
+  });
+});
+
+/* =========================
+   DEBUG DATABASE
+========================= */
+
+app.get("/api/debug", (req, res) => {
+  const sql = `
+    SELECT * FROM pengaduan
+    ORDER BY created_at DESC
+  `;
+
+  db.query(sql, (err, result) => {
+    if (err) {
+      console.log(err);
+
+      return res.status(500).json({
+        success: false,
+        error: err,
+      });
+    }
+
+    return res.json({
+      success: true,
+      total_data: result.length,
+      data: result,
+    });
+  });
 });
 
 /* =========================
@@ -97,22 +197,94 @@ app.post("/api/pengaduan", upload.single("foto"), async (req, res) => {
 
     const { judul, deskripsi, kategori } = req.body;
 
-    console.log("Judul:", judul);
-    console.log("Deskripsi:", deskripsi);
-    console.log("Kategori:", kategori);
+    // =========================
+    // VALIDASI INPUT
+    // =========================
+
+    if (!judul || !deskripsi || !kategori) {
+      return res.status(400).json({
+        success: false,
+        message: "Semua field wajib diisi",
+      });
+    }
+
+    let fotoUrl = "";
+
+    // =========================
+    // UPLOAD FOTO KE S3
+    // =========================
 
     if (req.file) {
-      console.log("📷 File diterima:", req.file.originalname);
+      console.log("📷 Upload foto ke S3");
+
+      const fileName = Date.now() + "-" + req.file.originalname;
+
+      const params = {
+        Bucket: process.env.S3_BUCKET,
+        Key: fileName,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype,
+      };
+
+      const uploadResult = await s3.upload(params).promise();
+
+      // =========================
+      // CLOUD FRONT URL
+      // =========================
+
+      const cloudfrontDomain =
+        process.env.CLOUDFRONT_URL || uploadResult.Location;
+
+      fotoUrl = uploadResult.Location.replace(
+        `https://${process.env.S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com`,
+        cloudfrontDomain,
+      );
+
+      console.log("✅ Upload berhasil");
+      console.log(fotoUrl);
     }
 
     // =========================
-    // MODE DEMO SEMENTARA
+    // SIMPAN KE DATABASE
     // =========================
 
-    return res.status(200).json({
-      success: true,
-      message: "✅ Pengaduan berhasil dikirim",
-    });
+    const sql = `
+      INSERT INTO pengaduan
+      (
+        judul,
+        deskripsi,
+        kategori,
+        foto_url,
+        status_pengaduan
+      )
+      VALUES (?, ?, ?, ?, ?)
+    `;
+
+    db.query(
+      sql,
+      [judul, deskripsi, kategori, fotoUrl, "Pending"],
+      (err, result) => {
+        if (err) {
+          console.log(err);
+
+          return res.status(500).json({
+            success: false,
+            message: "Gagal simpan pengaduan",
+          });
+        }
+
+        return res.status(200).json({
+          success: true,
+          message: "✅ Pengaduan berhasil dikirim",
+          data: {
+            judul,
+            kategori,
+            foto_url: fotoUrl,
+            status: "Pending",
+          },
+        });
+      },
+    );
   } catch (error) {
     console.log(error);
 
