@@ -25,6 +25,10 @@ app.use(express.static(path.join(__dirname, "public")));
 
 const upload = multer({
   storage: multer.memoryStorage(),
+
+  limits: {
+    fileSize: 50 * 1024 * 1024,
+  },
 });
 
 /* =========================
@@ -45,9 +49,9 @@ db.connect((err) => {
   } else {
     console.log("✅ Database connected");
 
-    // =========================
-    // CREATE DATABASE
-    // =========================
+    /* =========================
+       CREATE DATABASE
+    ========================= */
 
     db.query(`CREATE DATABASE IF NOT EXISTS laporwarga`, (err) => {
       if (err) {
@@ -56,9 +60,9 @@ db.connect((err) => {
       } else {
         console.log("✅ Database laporwarga siap");
 
-        // =========================
-        // USE DATABASE
-        // =========================
+        /* =========================
+           USE DATABASE
+        ========================= */
 
         db.changeUser(
           {
@@ -71,9 +75,9 @@ db.connect((err) => {
             } else {
               console.log("✅ Menggunakan database laporwarga");
 
-              // =========================
-              // CREATE TABLE
-              // =========================
+              /* =========================
+                 CREATE TABLE
+              ========================= */
 
               const createTable = `
                 CREATE TABLE IF NOT EXISTS pengaduan (
@@ -81,7 +85,9 @@ db.connect((err) => {
                   judul VARCHAR(255),
                   deskripsi TEXT,
                   kategori VARCHAR(100),
+                  lokasi VARCHAR(255),
                   foto_url TEXT,
+                  file_type VARCHAR(100),
                   status_pengaduan VARCHAR(50) DEFAULT 'Pending',
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -93,6 +99,34 @@ db.connect((err) => {
                   console.log(err);
                 } else {
                   console.log("✅ Table pengaduan siap");
+
+                  /* =========================
+                     ALTER TABLE
+                  ========================= */
+
+                  const alterQueries = [
+                    `
+                    ALTER TABLE pengaduan
+                    ADD COLUMN lokasi VARCHAR(255)
+                    `,
+                    `
+                    ALTER TABLE pengaduan
+                    ADD COLUMN file_type VARCHAR(100)
+                    `,
+                    `
+                    ALTER TABLE pengaduan
+                    ADD COLUMN status_pengaduan VARCHAR(50)
+                    DEFAULT 'Pending'
+                    `,
+                  ];
+
+                  alterQueries.forEach((query) => {
+                    db.query(query, (err) => {
+                      if (err) {
+                        console.log("ℹ️ Kolom mungkin sudah ada");
+                      }
+                    });
+                  });
                 }
               });
             }
@@ -140,12 +174,44 @@ app.get("/health", (req, res) => {
 ========================= */
 
 app.get("/api/pengaduan", (req, res) => {
-  const sql = `
+  const { kategori, search } = req.query;
+
+  let sql = `
     SELECT * FROM pengaduan
-    ORDER BY created_at DESC
+    WHERE 1=1
   `;
 
-  db.query(sql, (err, result) => {
+  const values = [];
+
+  /* =========================
+     FILTER KATEGORI
+  ========================= */
+
+  if (kategori && kategori !== "Semua") {
+    sql += ` AND kategori = ?`;
+
+    values.push(kategori);
+  }
+
+  /* =========================
+     SEARCH
+  ========================= */
+
+  if (search) {
+    sql += `
+      AND (
+        judul LIKE ?
+        OR deskripsi LIKE ?
+      )
+    `;
+
+    values.push(`%${search}%`);
+    values.push(`%${search}%`);
+  }
+
+  sql += ` ORDER BY created_at DESC`;
+
+  db.query(sql, values, (err, result) => {
     if (err) {
       console.log(err);
 
@@ -156,6 +222,37 @@ app.get("/api/pengaduan", (req, res) => {
     }
 
     return res.json(result);
+  });
+});
+
+/* =========================
+   STATS
+========================= */
+
+app.get("/api/stats", (req, res) => {
+  const sql = `
+    SELECT
+      COUNT(*) as total,
+
+      SUM(
+        CASE
+          WHEN status_pengaduan='Pending'
+          THEN 1
+          ELSE 0
+        END
+      ) as pending,
+
+      COUNT(DISTINCT kategori) as kategori
+
+    FROM pengaduan
+  `;
+
+  db.query(sql, (err, result) => {
+    if (err) {
+      return res.status(500).json(err);
+    }
+
+    res.json(result[0]);
   });
 });
 
@@ -191,31 +288,32 @@ app.get("/api/debug", (req, res) => {
    POST DATA
 ========================= */
 
-app.post("/api/pengaduan", upload.single("foto"), async (req, res) => {
+app.post("/api/pengaduan", upload.single("file"), async (req, res) => {
   try {
     console.log("📩 Pengaduan masuk");
 
-    const { judul, deskripsi, kategori } = req.body;
+    const { judul, deskripsi, kategori, lokasi } = req.body;
 
-    // =========================
-    // VALIDASI INPUT
-    // =========================
+    /* =========================
+         VALIDASI INPUT
+      ========================= */
 
     if (!judul || !deskripsi || !kategori) {
       return res.status(400).json({
         success: false,
-        message: "Semua field wajib diisi",
+        message: "Field wajib belum lengkap",
       });
     }
 
     let fotoUrl = "";
+    let fileType = "";
 
-    // =========================
-    // UPLOAD FOTO KE S3
-    // =========================
+    /* =========================
+         UPLOAD FILE KE S3
+      ========================= */
 
     if (req.file) {
-      console.log("📷 Upload foto ke S3");
+      console.log("📷 Upload file ke S3");
 
       const fileName = Date.now() + "-" + req.file.originalname;
 
@@ -224,13 +322,14 @@ app.post("/api/pengaduan", upload.single("foto"), async (req, res) => {
         Key: fileName,
         Body: req.file.buffer,
         ContentType: req.file.mimetype,
+        ContentDisposition: "attachment",
       };
 
       const uploadResult = await s3.upload(params).promise();
 
-      // =========================
-      // CLOUD FRONT URL
-      // =========================
+      /* =========================
+           CLOUD FRONT URL
+        ========================= */
 
       const cloudfrontDomain =
         process.env.CLOUDFRONT_URL || uploadResult.Location;
@@ -240,29 +339,41 @@ app.post("/api/pengaduan", upload.single("foto"), async (req, res) => {
         cloudfrontDomain,
       );
 
+      fileType = req.file.mimetype;
+
       console.log("✅ Upload berhasil");
       console.log(fotoUrl);
     }
 
-    // =========================
-    // SIMPAN KE DATABASE
-    // =========================
+    /* =========================
+         SIMPAN DATABASE
+      ========================= */
 
     const sql = `
-      INSERT INTO pengaduan
-      (
-        judul,
-        deskripsi,
-        kategori,
-        foto_url,
-        status_pengaduan
-      )
-      VALUES (?, ?, ?, ?, ?)
-    `;
+        INSERT INTO pengaduan
+        (
+          judul,
+          deskripsi,
+          kategori,
+          lokasi,
+          foto_url,
+          file_type,
+          status_pengaduan
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `;
 
     db.query(
       sql,
-      [judul, deskripsi, kategori, fotoUrl, "Pending"],
+      [
+        judul,
+        deskripsi,
+        kategori,
+        lokasi || null,
+        fotoUrl,
+        fileType,
+        "Pending",
+      ],
       (err, result) => {
         if (err) {
           console.log(err);
@@ -276,11 +387,13 @@ app.post("/api/pengaduan", upload.single("foto"), async (req, res) => {
         return res.status(200).json({
           success: true,
           message: "✅ Pengaduan berhasil dikirim",
+
           data: {
             judul,
             kategori,
+            lokasi,
             foto_url: fotoUrl,
-            status: "Pending",
+            file_type: fileType,
           },
         });
       },
